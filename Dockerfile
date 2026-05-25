@@ -2,7 +2,7 @@
 FROM eclipse-temurin:21-jdk-alpine AS build
 WORKDIR /app
 COPY . .
-RUN ./mvnw package -DskipTests
+RUN chmod +x mvnw && ./mvnw package -DskipTests
 
 # Stage 2: Run the JAR
 FROM eclipse-temurin:21-jre-alpine
