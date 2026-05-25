@@ -1,0 +1,5 @@
+target/
+*.class
+*.log
+.DS_Store
+# Keep static/browser (Angular build) — needed for Railway deployment without Node.js
