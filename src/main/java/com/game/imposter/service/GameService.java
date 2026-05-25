@@ -16,7 +16,7 @@ public class GameService {
 
     private final Map<String, GameRoom> rooms = new ConcurrentHashMap<>();
     private final SimpMessagingTemplate messagingTemplate;
-    private final TaskService taskService;
+    private final WordService wordService;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(20);
 
     private static final String[] COLORS = {
@@ -50,7 +50,7 @@ public class GameService {
         Player player = buildPlayer(playerId, playerName, color);
         room.getPlayers().put(playerId, player);
 
-        broadcast(roomCode, "PLAYER_JOINED", Map.of("player", toDto(player, room)));
+        broadcast(roomCode, "PLAYER_JOINED", Map.of("playerName", player.getName()));
         return RoomResponse.builder().roomCode(roomCode).playerId(playerId).build();
     }
 
@@ -62,13 +62,9 @@ public class GameService {
         if (room.getPlayers().size() < 3) throw new IllegalStateException("Need at least 3 players");
         if (room.getPhase() != GamePhase.LOBBY) throw new IllegalStateException("Game already started");
 
-        assignRolesAndTasks(room);
+        assignWords(room);
         room.setRound(1);
-        room.setPhase(GamePhase.ROLE_REVEAL);
-        room.setPhaseEndsAt(System.currentTimeMillis() + 4_000);
-
-        broadcast(roomCode, "GAME_STARTED", Map.of("phase", "ROLE_REVEAL"));
-        schedule(room, GamePhase.TASK, 4);
+        transitionTo(room, GamePhase.WORD_REVEAL);
     }
 
     // ── State query ────────────────────────────────────────────────────────────
@@ -77,126 +73,124 @@ public class GameService {
         GameRoom room = requireRoom(roomCode);
         Player me = room.getPlayers().get(playerId);
 
-        Task currentTask = null;
-        if (room.getPhase() == GamePhase.TASK && me != null && me.isAlive()
-                && me.getRole() == PlayerRole.CREWMATE) {
-            List<Task> tasks = me.getTasks();
-            int idx = me.getCurrentTaskIndex();
-            if (tasks != null && idx < tasks.size()) currentTask = tasks.get(idx);
-        }
-
-        Map<String, Integer> voteCounts = new HashMap<>();
-        room.getVotes().values().forEach(tid -> voteCounts.merge(tid, 1, Integer::sum));
-
-        String lastEjectedName = null;
-        if (room.getLastEjectedId() != null) {
-            Player ej = room.getPlayers().get(room.getLastEjectedId());
-            if (ej != null) lastEjectedName = ej.getName();
-        } else if (room.getPhase() == GamePhase.VOTE_RESULT) {
-            lastEjectedName = "Nobody";
-        }
-
+        // Reveal words only in RESULT phase
+        String revealedSecretWord = null;
+        String revealedImposterWord = null;
         String imposterName = null;
-        if (room.getPhase() == GamePhase.ENDED) {
+        if (room.getPhase() == GamePhase.RESULT) {
+            revealedSecretWord = room.getSecretWord();
+            revealedImposterWord = room.getImposterWord();
             imposterName = room.getPlayers().values().stream()
                     .filter(p -> p.getRole() == PlayerRole.IMPOSTER)
                     .map(Player::getName).findFirst().orElse("Unknown");
         }
 
+        Map<String, Integer> voteCounts = new HashMap<>();
+        room.getVotes().values().forEach(tid -> voteCounts.merge(tid, 1, Integer::sum));
+
         return GameStateDto.builder()
                 .roomCode(roomCode)
                 .phase(room.getPhase())
                 .round(room.getRound())
-                .players(room.getPlayers().values().stream().map(p -> toDto(p, room)).collect(Collectors.toList()))
+                .players(room.getPlayers().values().stream()
+                        .sorted(Comparator.comparing(Player::getName))
+                        .map(p -> toDto(p, room))
+                        .collect(Collectors.toList()))
                 .myRole(me != null ? me.getRole() : null)
-                .currentTask(currentTask)
-                .chat(new ArrayList<>(room.getChat()))
+                .myWord(me != null ? me.getAssignedWord() : null)
+                .myClueGiven(me != null && me.isClueGivenThisRound())
+                .allClues(new ArrayList<>(room.getAllClues()))
                 .voteCounts(voteCounts)
                 .winner(room.getWinner())
-                .lastEjectedName(lastEjectedName)
-                .lastEjectedWasImposter(room.isLastEjectedWasImposter())
+                .imposterCaught(room.isImposterCaught())
+                .secretWord(revealedSecretWord)
+                .imposterWord(revealedImposterWord)
+                .imposterGuessCorrect(room.isImposterGuessCorrect())
                 .imposterName(imposterName)
                 .phaseEndsAt(room.getPhaseEndsAt())
-                .emergencyMeetingUsed(room.isEmergencyMeetingUsed())
-                .imposterKillUsed(room.isImposterKillUsed())
                 .hostId(room.getHostId())
                 .build();
     }
 
-    // ── Actions ────────────────────────────────────────────────────────────────
+    // ── Player actions ─────────────────────────────────────────────────────────
 
-    public void completeTask(String roomCode, String playerId, String answer) {
+    public void submitClue(String roomCode, String playerId, String clue) {
         GameRoom room = requireRoom(roomCode);
-        if (room.getPhase() != GamePhase.TASK) return;
+        if (room.getPhase() != GamePhase.CLUE_ROUND) return;
+
         Player player = room.getPlayers().get(playerId);
-        if (player == null || !player.isAlive() || player.getRole() != PlayerRole.CREWMATE) return;
+        if (player == null || player.isClueGivenThisRound()) return;
 
-        List<Task> tasks = player.getTasks();
-        int idx = player.getCurrentTaskIndex();
-        if (tasks == null || idx >= tasks.size()) return;
-        Task task = tasks.get(idx);
-        if (task.isCompleted()) return;
+        // Accept first word only, trim whitespace, limit length
+        String cleanClue = clue == null ? "" : clue.trim().split("\\s+")[0];
+        if (cleanClue.isEmpty() || cleanClue.length() > 30) return;
 
-        if (task.getCorrectAnswer().equals(answer)) {
-            task.setCompleted(true);
-            player.setTasksCompleted(player.getTasksCompleted() + 1);
-            player.setCurrentTaskIndex(idx + 1);
-            broadcast(roomCode, "TASK_COMPLETED", Map.of("playerName", player.getName()));
-            checkCrewWin(room);
+        synchronized (room) {
+            if (player.isClueGivenThisRound()) return; // double-check inside lock
+            player.setClueGivenThisRound(true);
+            player.getClues().add(cleanClue);
+
+            ClueEntry entry = ClueEntry.builder()
+                    .playerId(playerId)
+                    .playerName(player.getName())
+                    .color(player.getColor())
+                    .word(cleanClue)
+                    .round(room.getRound())
+                    .build();
+            room.getAllClues().add(entry);
+
+            broadcast(roomCode, "CLUE_SUBMITTED", Map.of(
+                    "playerId", playerId,
+                    "playerName", player.getName(),
+                    "color", player.getColor(),
+                    "word", cleanClue,
+                    "round", room.getRound()));
+
+            // Advance early if everyone has submitted
+            long total = room.getPlayers().size();
+            long submitted = room.getPlayers().values().stream()
+                    .filter(Player::isClueGivenThisRound).count();
+            if (submitted >= total) {
+                advanceFromClueRound(room);
+            }
         }
-    }
-
-    public void eliminate(String roomCode, String imposterId, String targetId) {
-        GameRoom room = requireRoom(roomCode);
-        if (room.getPhase() != GamePhase.TASK || room.isImposterKillUsed()) return;
-        Player imposter = room.getPlayers().get(imposterId);
-        if (imposter == null || imposter.getRole() != PlayerRole.IMPOSTER || !imposter.isAlive()) return;
-        Player target = room.getPlayers().get(targetId);
-        if (target == null || !target.isAlive() || target.getRole() == PlayerRole.IMPOSTER) return;
-
-        target.setAlive(false);
-        room.setImposterKillUsed(true);
-        broadcast(roomCode, "PLAYER_ELIMINATED", Map.of(
-                "playerId", targetId, "playerName", target.getName()));
-        checkImposterWin(room);
-    }
-
-    public void callMeeting(String roomCode, String callerId) {
-        GameRoom room = requireRoom(roomCode);
-        if (room.getPhase() != GamePhase.TASK || room.isEmergencyMeetingUsed()) return;
-        Player caller = room.getPlayers().get(callerId);
-        if (caller == null || !caller.isAlive()) return;
-
-        room.setEmergencyMeetingUsed(true);
-        broadcast(roomCode, "EMERGENCY_MEETING", Map.of("callerName", caller.getName()));
-        transitionTo(room, GamePhase.DISCUSSION);
-    }
-
-    public void sendChat(String roomCode, String senderId, String message) {
-        GameRoom room = requireRoom(roomCode);
-        if (room.getPhase() != GamePhase.DISCUSSION) return;
-        Player sender = room.getPlayers().get(senderId);
-        if (sender == null || !sender.isAlive()) return;
-
-        ChatMessage msg = ChatMessage.builder()
-                .senderId(senderId).senderName(sender.getName())
-                .message(message).timestamp(System.currentTimeMillis()).build();
-        room.getChat().add(msg);
-        broadcast(roomCode, "CHAT_MESSAGE", msg);
     }
 
     public void castVote(String roomCode, String voterId, String targetId) {
         GameRoom room = requireRoom(roomCode);
         if (room.getPhase() != GamePhase.VOTING) return;
+
         Player voter = room.getPlayers().get(voterId);
-        if (voter == null || !voter.isAlive() || voter.isHasVoted()) return;
+        if (voter == null || voter.isHasVoted()) return;
 
-        voter.setHasVoted(true);
-        room.getVotes().put(voterId, targetId != null ? targetId : "SKIP");
-        broadcast(roomCode, "VOTE_CAST", Map.of("voterName", voter.getName()));
+        synchronized (room) {
+            if (voter.isHasVoted()) return;
+            voter.setHasVoted(true);
+            room.getVotes().put(voterId, targetId != null ? targetId : "SKIP");
+            broadcast(roomCode, "VOTE_CAST", Map.of("voterName", voter.getName()));
 
-        long aliveCount = room.getPlayers().values().stream().filter(Player::isAlive).count();
-        if (room.getVotes().size() >= aliveCount) processVotes(room);
+            long playerCount = room.getPlayers().size();
+            if (room.getVotes().size() >= playerCount) {
+                processVotes(room);
+            }
+        }
+    }
+
+    public void submitGuess(String roomCode, String playerId, String guess) {
+        GameRoom room = requireRoom(roomCode);
+        if (room.getPhase() != GamePhase.IMPOSTER_GUESS) return;
+
+        Player player = room.getPlayers().get(playerId);
+        if (player == null || player.getRole() != PlayerRole.IMPOSTER) return;
+
+        String cleanGuess = guess == null ? "" : guess.trim();
+        if (cleanGuess.isEmpty()) return;
+
+        room.setImposterGuessWord(cleanGuess);
+        room.setImposterGuessCorrect(cleanGuess.equalsIgnoreCase(room.getSecretWord()));
+
+        cancelTimer(room);
+        endGame(room);
     }
 
     // ── Phase transitions ──────────────────────────────────────────────────────
@@ -204,128 +198,169 @@ public class GameService {
     private void transitionTo(GameRoom room, GamePhase next) {
         cancelTimer(room);
         room.setPhase(next);
+        String code = room.getRoomCode();
+
         switch (next) {
-            case TASK -> {
-                room.setImposterKillUsed(false);
-                room.getPlayers().values().forEach(p -> p.setHasVoted(false));
-                room.setPhaseEndsAt(System.currentTimeMillis() + 45_000);
-                broadcast(room.getRoomCode(), "PHASE_CHANGE", Map.of("phase", "TASK", "duration", 45));
-                schedule(room, GamePhase.DISCUSSION, 45);
-            }
-            case DISCUSSION -> {
-                room.setPhaseEndsAt(System.currentTimeMillis() + 30_000);
-                broadcast(room.getRoomCode(), "PHASE_CHANGE", Map.of("phase", "DISCUSSION", "duration", 30));
-                schedule(room, GamePhase.VOTING, 30);
+            case WORD_REVEAL -> {
+                room.setPhaseEndsAt(System.currentTimeMillis() + 6_000);
+                broadcast(code, "PHASE_CHANGE", Map.of("phase", "WORD_REVEAL", "duration", 6));
+                room.setPhaseTimer(scheduler.schedule(
+                        () -> startClueRound(room), 6, TimeUnit.SECONDS));
             }
             case VOTING -> {
                 room.setVotes(new ConcurrentHashMap<>());
                 room.getPlayers().values().forEach(p -> p.setHasVoted(false));
-                room.setPhaseEndsAt(System.currentTimeMillis() + 20_000);
-                broadcast(room.getRoomCode(), "PHASE_CHANGE", Map.of("phase", "VOTING", "duration", 20));
-                schedule(room, GamePhase.VOTE_RESULT, 20);
+                room.setPhaseEndsAt(System.currentTimeMillis() + 30_000);
+                broadcast(code, "PHASE_CHANGE", Map.of("phase", "VOTING", "duration", 30));
+                room.setPhaseTimer(scheduler.schedule(
+                        () -> processVotes(room), 30, TimeUnit.SECONDS));
             }
-            case VOTE_RESULT -> processVotes(room);
+            case IMPOSTER_GUESS -> {
+                room.setPhaseEndsAt(System.currentTimeMillis() + 15_000);
+                broadcast(code, "PHASE_CHANGE", Map.of("phase", "IMPOSTER_GUESS", "duration", 15));
+                room.setPhaseTimer(scheduler.schedule(
+                        () -> endGame(room), 15, TimeUnit.SECONDS));
+            }
+            case RESULT -> endGame(room);
             default -> { }
+        }
+    }
+
+    /** Starts (or restarts) the CLUE_ROUND phase for the current round number. */
+    private void startClueRound(GameRoom room) {
+        cancelTimer(room);
+        room.setPhase(GamePhase.CLUE_ROUND);
+        room.getPlayers().values().forEach(p -> p.setClueGivenThisRound(false));
+        room.setPhaseEndsAt(System.currentTimeMillis() + 60_000);
+        broadcast(room.getRoomCode(), "PHASE_CHANGE",
+                Map.of("phase", "CLUE_ROUND", "round", room.getRound(), "duration", 60));
+        room.setPhaseTimer(scheduler.schedule(
+                () -> advanceFromClueRound(room), 60, TimeUnit.SECONDS));
+    }
+
+    /** Called when a clue round ends (timer or early exit). */
+    private void advanceFromClueRound(GameRoom room) {
+        cancelTimer(room);
+        if (room.getRound() < 2) {
+            room.setRound(room.getRound() + 1);
+            startClueRound(room);
+        } else {
+            transitionTo(room, GamePhase.VOTING);
         }
     }
 
     private void processVotes(GameRoom room) {
         cancelTimer(room);
-        room.setPhase(GamePhase.VOTE_RESULT);
+        String imposterId = getImposterId(room);
 
+        // Tally votes (skip "SKIP")
         Map<String, Long> counts = room.getVotes().values().stream()
                 .filter(v -> !"SKIP".equals(v))
                 .collect(Collectors.groupingBy(v -> v, Collectors.counting()));
 
-        String ejectedId = counts.entrySet().stream()
+        String topVoted = counts.entrySet().stream()
                 .max(Map.Entry.comparingByValue())
                 .map(Map.Entry::getKey).orElse(null);
 
-        if (ejectedId != null) {
-            long max = counts.get(ejectedId);
-            if (counts.values().stream().filter(v -> v == max).count() > 1) ejectedId = null;
-        }
-
-        boolean wasImposter = false;
-        String ejectedName = "Nobody";
-        if (ejectedId != null) {
-            Player ejected = room.getPlayers().get(ejectedId);
-            if (ejected != null) {
-                ejected.setAlive(false);
-                wasImposter = ejected.getRole() == PlayerRole.IMPOSTER;
-                ejectedName = ejected.getName();
-                room.setLastEjectedId(ejectedId);
-                room.setLastEjectedWasImposter(wasImposter);
-            }
-        } else {
-            room.setLastEjectedId(null);
-        }
+        boolean caught = topVoted != null && topVoted.equals(imposterId);
+        room.setImposterCaught(caught);
 
         broadcast(room.getRoomCode(), "VOTE_RESULT", Map.of(
-                "ejectedName", ejectedName, "wasImposter", wasImposter));
+                "imposterCaught", caught,
+                "topVotedId", topVoted != null ? topVoted : ""));
 
-        if (wasImposter) { endGame(room, "CREWMATES"); return; }
-        if (checkImposterWin(room)) return;
-
-        room.setRound(room.getRound() + 1);
-        room.getChat().clear();
-        schedule(room, GamePhase.TASK, 5);
+        if (caught) {
+            transitionTo(room, GamePhase.IMPOSTER_GUESS);
+        } else {
+            endGame(room);
+        }
     }
 
-    // ── Win checks ─────────────────────────────────────────────────────────────
-
-    private void checkCrewWin(GameRoom room) {
-        long needed = room.getPlayers().values().stream()
-                .filter(p -> p.getRole() == PlayerRole.CREWMATE && p.isAlive())
-                .mapToLong(Player::getTotalTasks).sum();
-        long done = room.getPlayers().values().stream()
-                .filter(p -> p.getRole() == PlayerRole.CREWMATE && p.isAlive())
-                .mapToLong(Player::getTasksCompleted).sum();
-        if (needed > 0 && done >= needed) endGame(room, "CREWMATES");
-    }
-
-    private boolean checkImposterWin(GameRoom room) {
-        long crew = room.getPlayers().values().stream()
-                .filter(p -> p.isAlive() && p.getRole() == PlayerRole.CREWMATE).count();
-        long imp = room.getPlayers().values().stream()
-                .filter(p -> p.isAlive() && p.getRole() == PlayerRole.IMPOSTER).count();
-        if (imp >= crew) { endGame(room, "IMPOSTERS"); return true; }
-        return false;
-    }
-
-    private void endGame(GameRoom room, String winner) {
+    private void endGame(GameRoom room) {
         cancelTimer(room);
-        room.setPhase(GamePhase.ENDED);
-        room.setWinner(winner);
-        String impName = room.getPlayers().values().stream()
-                .filter(p -> p.getRole() == PlayerRole.IMPOSTER)
-                .map(Player::getName).findFirst().orElse("Unknown");
-        broadcast(room.getRoomCode(), "GAME_ENDED", Map.of("winner", winner, "imposterName", impName));
+        calculateScores(room);
+        room.setPhase(GamePhase.RESULT);
+        room.setPhaseEndsAt(0);
+
+        String imposterId = getImposterId(room);
+        String imposterName = imposterId != null
+                ? room.getPlayers().get(imposterId).getName() : "Unknown";
+
+        broadcast(room.getRoomCode(), "GAME_ENDED", Map.of(
+                "winner", room.getWinner() != null ? room.getWinner() : "UNKNOWN",
+                "imposterName", imposterName,
+                "secretWord", room.getSecretWord() != null ? room.getSecretWord() : "",
+                "imposterWord", room.getImposterWord() != null ? room.getImposterWord() : "",
+                "imposterGuessCorrect", room.isImposterGuessCorrect()));
+    }
+
+    private void calculateScores(GameRoom room) {
+        String imposterId = getImposterId(room);
+        if (imposterId == null) return;
+
+        if (room.isImposterCaught()) {
+            room.setWinner("CREWMATES");
+            // +2 for each player who voted for the imposter
+            room.getVotes().forEach((voterId, targetId) -> {
+                if (imposterId.equals(targetId)) {
+                    Player voter = room.getPlayers().get(voterId);
+                    if (voter != null) voter.setScore(voter.getScore() + 2);
+                }
+            });
+            // +2 bonus if the imposter guessed the secret word correctly
+            if (room.isImposterGuessCorrect()) {
+                Player imp = room.getPlayers().get(imposterId);
+                if (imp != null) imp.setScore(imp.getScore() + 2);
+            }
+        } else {
+            room.setWinner("IMPOSTER");
+            // +3 for the imposter escaping
+            Player imp = room.getPlayers().get(imposterId);
+            if (imp != null) imp.setScore(imp.getScore() + 3);
+        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private void assignRolesAndTasks(GameRoom room) {
+    private void assignWords(GameRoom room) {
+        String[] pair = wordService.getRandomPair();
+        room.setSecretWord(pair[0]);
+        room.setImposterWord(pair[1]);
+
+        // Reset clue history and scores
+        room.setAllClues(new ArrayList<>());
+        room.setWinner(null);
+        room.setImposterCaught(false);
+        room.setImposterGuessWord(null);
+        room.setImposterGuessCorrect(false);
+
         List<String> ids = new ArrayList<>(room.getPlayers().keySet());
         Collections.shuffle(ids);
-        int imposters = ids.size() >= 6 ? 2 : 1;
-        for (int i = 0; i < ids.size(); i++) {
-            Player p = room.getPlayers().get(ids.get(i));
-            p.setRole(i < imposters ? PlayerRole.IMPOSTER : PlayerRole.CREWMATE);
-            if (p.getRole() == PlayerRole.CREWMATE) {
-                List<Task> tasks = taskService.generateTasksForPlayer();
-                p.setTasks(tasks);
-                p.setTotalTasks(tasks.size());
-                p.setCurrentTaskIndex(0);
+
+        // First player in shuffled list becomes the imposter
+        String imposterId = ids.get(0);
+
+        for (String id : ids) {
+            Player p = room.getPlayers().get(id);
+            p.setClues(new ArrayList<>());
+            p.setScore(0);
+            p.setClueGivenThisRound(false);
+            p.setHasVoted(false);
+            if (id.equals(imposterId)) {
+                p.setRole(PlayerRole.IMPOSTER);
+                p.setAssignedWord(pair[1]);
+            } else {
+                p.setRole(PlayerRole.CREWMATE);
+                p.setAssignedWord(pair[0]);
             }
-            p.setAlive(true);
         }
     }
 
-    private void schedule(GameRoom room, GamePhase next, int seconds) {
-        ScheduledFuture<?> future = scheduler.schedule(
-                () -> transitionTo(room, next), seconds, TimeUnit.SECONDS);
-        room.setPhaseTimer(future);
+    private String getImposterId(GameRoom room) {
+        return room.getPlayers().values().stream()
+                .filter(p -> p.getRole() == PlayerRole.IMPOSTER)
+                .map(Player::getId)
+                .findFirst().orElse(null);
     }
 
     private void cancelTimer(GameRoom room) {
@@ -345,15 +380,20 @@ public class GameService {
     }
 
     private Player buildPlayer(String id, String name, String color) {
-        return Player.builder().id(id).name(name).color(color).alive(true).build();
+        return Player.builder().id(id).name(name).color(color).build();
     }
 
     private PlayerDto toDto(Player p, GameRoom room) {
         return PlayerDto.builder()
-                .id(p.getId()).name(p.getName()).alive(p.isAlive())
-                .tasksCompleted(p.getTasksCompleted()).totalTasks(p.getTotalTasks())
-                .color(p.getColor()).isHost(p.getId().equals(room.getHostId()))
-                .hasVoted(p.isHasVoted()).build();
+                .id(p.getId())
+                .name(p.getName())
+                .color(p.getColor())
+                .host(p.getId().equals(room.getHostId()))
+                .hasVoted(p.isHasVoted())
+                .clueGivenThisRound(p.isClueGivenThisRound())
+                .score(p.getScore())
+                .clues(new ArrayList<>(p.getClues()))
+                .build();
     }
 
     private String generateRoomCode() {

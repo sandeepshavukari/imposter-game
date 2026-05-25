@@ -13,16 +13,26 @@ public class GameStateDto {
     private GamePhase phase;
     private int round;
     private List<PlayerDto> players;
+
+    // Personal info (only for this player)
     private PlayerRole myRole;
-    private Task currentTask;
-    private List<ChatMessage> chat;
+    private String myWord;         // player's own assigned word
+    private boolean myClueGiven;   // has this player submitted a clue this round?
+
+    // Clue feed (grows as players submit)
+    private List<ClueEntry> allClues;
+
+    // Voting
     private Map<String, Integer> voteCounts;
+
+    // End-game reveals (only populated in RESULT phase)
     private String winner;
-    private String lastEjectedName;
-    private boolean lastEjectedWasImposter;
-    private String imposterName;
+    private boolean imposterCaught;
+    private String secretWord;          // crewmate word — revealed at RESULT
+    private String imposterWord;        // imposter word  — revealed at RESULT
+    private boolean imposterGuessCorrect;
+    private String imposterName;        // revealed at RESULT
+
     private long phaseEndsAt;
-    private boolean emergencyMeetingUsed;
-    private boolean imposterKillUsed;
     private String hostId;
 }

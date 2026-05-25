@@ -17,28 +17,18 @@ public class GameWebSocketController {
         gameService.startGame(req.getRoomCode(), req.getPlayerId());
     }
 
-    @MessageMapping("/game/task/complete")
-    public void completeTask(@Payload GameActionRequest req) {
-        gameService.completeTask(req.getRoomCode(), req.getPlayerId(), req.getAnswer());
-    }
-
-    @MessageMapping("/game/eliminate")
-    public void eliminate(@Payload GameActionRequest req) {
-        gameService.eliminate(req.getRoomCode(), req.getPlayerId(), req.getTargetId());
-    }
-
-    @MessageMapping("/game/meeting")
-    public void callMeeting(@Payload GameActionRequest req) {
-        gameService.callMeeting(req.getRoomCode(), req.getPlayerId());
-    }
-
-    @MessageMapping("/game/chat")
-    public void sendChat(@Payload GameActionRequest req) {
-        gameService.sendChat(req.getRoomCode(), req.getPlayerId(), req.getMessage());
+    @MessageMapping("/game/clue")
+    public void submitClue(@Payload GameActionRequest req) {
+        gameService.submitClue(req.getRoomCode(), req.getPlayerId(), req.getClue());
     }
 
     @MessageMapping("/game/vote")
     public void castVote(@Payload GameActionRequest req) {
         gameService.castVote(req.getRoomCode(), req.getPlayerId(), req.getTargetId());
+    }
+
+    @MessageMapping("/game/guess")
+    public void submitGuess(@Payload GameActionRequest req) {
+        gameService.submitGuess(req.getRoomCode(), req.getPlayerId(), req.getGuess());
     }
 }

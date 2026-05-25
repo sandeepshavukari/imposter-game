@@ -6,7 +6,7 @@ import lombok.Data;
 public class GameActionRequest {
     private String roomCode;
     private String playerId;
-    private String targetId;
-    private String message;
-    private String answer;
+    private String targetId;   // for voting
+    private String clue;       // for clue submission
+    private String guess;      // for imposter's word guess
 }

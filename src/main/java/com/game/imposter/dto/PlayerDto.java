@@ -1,6 +1,7 @@
 package com.game.imposter.dto;
 
 import lombok.*;
+import java.util.List;
 
 @Data
 @Builder
@@ -9,10 +10,10 @@ import lombok.*;
 public class PlayerDto {
     private String id;
     private String name;
-    private boolean alive;
-    private int tasksCompleted;
-    private int totalTasks;
     private String color;
-    private boolean isHost;
+    private boolean host;
     private boolean hasVoted;
+    private boolean clueGivenThisRound;
+    private int score;
+    private List<String> clues; // visible to all (for voting/result display)
 }

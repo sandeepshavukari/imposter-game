@@ -11,13 +11,19 @@ public class GameRoom {
     private String hostId;
     private GamePhase phase = GamePhase.LOBBY;
     private int round = 0;
+
+    // Word deduction fields
+    private String secretWord;      // word given to crewmates
+    private String imposterWord;    // word given to the imposter
+
+    private List<ClueEntry> allClues = new ArrayList<>();
     private Map<String, String> votes = new ConcurrentHashMap<>();
-    private List<ChatMessage> chat = new ArrayList<>();
-    private boolean emergencyMeetingUsed = false;
-    private boolean imposterKillUsed = false;
+
     private String winner;
-    private String lastEjectedId;
-    private boolean lastEjectedWasImposter;
+    private boolean imposterCaught;
+    private String imposterGuessWord;
+    private boolean imposterGuessCorrect;
+
     private long phaseEndsAt;
 
     @com.fasterxml.jackson.annotation.JsonIgnore
